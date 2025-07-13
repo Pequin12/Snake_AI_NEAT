@@ -160,6 +160,9 @@ class SnakeAI:
         self.running = False
         self.current_generation = 0
         self.best_fitness = 0
+        self.current_individual = 0
+        self.total_individuals = 0
+        self.generation_fitnesses = []
         
         # Initialize game analyzer
         self.game_analyzer = SnakeGameAnalyzer()
@@ -284,21 +287,13 @@ survival_threshold = 0.2
                 time.sleep(0.1)
     
     def detect_death(self, current_state, previous_state):
-        """Detect if the snake died by comparing game states"""
+        """Detect if the snake died by checking if 10% of the screen changed rapidly"""
         if previous_state is None:
             return False
         
-        # Count body segments in current vs previous state
-        current_body_count = np.sum(current_state == 2)
-        previous_body_count = np.sum(previous_state == 2)
-        
-        # If body count drops significantly, snake likely died
-        if current_body_count < previous_body_count * 0.5:
-            return True
-        
-        # Also check for sudden major changes in game state
+        # Check for sudden major changes in game state (10% threshold)
         state_diff = np.sum(np.abs(current_state - previous_state))
-        if state_diff > len(current_state) * 0.4:  # 40% of state changed
+        if state_diff > len(current_state) * 0.1:  # 10% of state changed
             return True
         
         return False
@@ -322,15 +317,76 @@ survival_threshold = 0.2
             pyautogui.press(key_map[action])
     
     def restart_game(self):
-        """Restart the game by pressing space"""
+        """Restart the game by pressing space, then right arrow to start movement"""
+        # Wait 0.3 seconds before pressing space
+        time.sleep(0.3)
+        
+        # Press space to restart
         pyautogui.press('space')
-        time.sleep(0.5)  # Wait for game to restart
+        
+        # Immediately press right arrow to start the snake moving
+        pyautogui.press('right')
+        
+        # Reset tracking variables
         self.game_start_time = time.time()
         self.death_detected = False
         self.last_score = 0
+        
+        # Clear the screen queue to avoid old state data
+        while not self.screen_queue.empty():
+            try:
+                self.screen_queue.get_nowait()
+            except queue.Empty:
+                break
     
-    def evaluate_genome(self, genome, config):
+    def print_agent_header(self, genome_id):
+        """Print detailed header for current agent"""
+        print(f"\n{'='*80}")
+        print(f"🤖 AGENT EVALUATION")
+        print(f"{'='*80}")
+        print(f"Generation: {self.current_generation}")
+        print(f"Individual: {self.current_individual}/{self.total_individuals}")
+        print(f"Genome ID: {genome_id}")
+        print(f"Current Best Fitness (All Generations): {self.best_fitness:.2f}")
+        if self.generation_fitnesses:
+            print(f"Best Fitness This Generation: {max(self.generation_fitnesses):.2f}")
+            print(f"Average Fitness This Generation: {np.mean(self.generation_fitnesses):.2f}")
+        print(f"{'='*80}")
+    
+    def print_agent_death_summary(self, genome_id, fitness, frames_alive, max_score):
+        """Print summary when agent dies"""
+        print(f"\n{'='*80}")
+        print(f"💀 AGENT DEATH SUMMARY")
+        print(f"{'='*80}")
+        print(f"Generation: {self.current_generation}")
+        print(f"Individual: {self.current_individual}/{self.total_individuals}")
+        print(f"Genome ID: {genome_id}")
+        print(f"Final Fitness: {fitness:.2f}")
+        print(f"Frames Survived: {frames_alive}")
+        print(f"Max Score Achieved: {max_score}")
+        print(f"Current Best Fitness (All Generations): {self.best_fitness:.2f}")
+        
+        # Show performance relative to generation
+        if self.generation_fitnesses:
+            gen_avg = np.mean(self.generation_fitnesses)
+            gen_best = max(self.generation_fitnesses)
+            performance_vs_avg = ((fitness - gen_avg) / gen_avg * 100) if gen_avg > 0 else 0
+            performance_vs_best = ((fitness - gen_best) / gen_best * 100) if gen_best > 0 else 0
+            
+            print(f"Performance vs Generation Average: {performance_vs_avg:+.1f}%")
+            print(f"Performance vs Generation Best: {performance_vs_best:+.1f}%")
+        
+        # Show if this is a new record
+        if fitness > self.best_fitness:
+            print(f"🎉 NEW OVERALL RECORD! Previous best: {self.best_fitness:.2f}")
+        
+        print(f"{'='*80}")
+    
+    def evaluate_genome(self, genome, config, genome_id):
         """Evaluate a single genome"""
+        # Print agent header
+        self.print_agent_header(genome_id)
+        
         # Create neural network
         net = neat.nn.FeedForwardNetwork.create(genome, config)
         
@@ -344,6 +400,11 @@ survival_threshold = 0.2
         max_score = 0
         
         previous_state = None
+        frames_since_restart = 0
+        
+        # Progress tracking
+        print(f"🏁 Starting evaluation... (max frames: {max_frames})")
+        last_progress_report = 0
         
         while frames_alive < max_frames and self.running:
             try:
@@ -351,9 +412,17 @@ survival_threshold = 0.2
                 if not self.screen_queue.empty():
                     current_state = self.screen_queue.get_nowait()
                     
+                    # Skip first few frames after restart to let game stabilize
+                    if frames_since_restart < 10:
+                        frames_since_restart += 1
+                        previous_state = current_state.copy()
+                        continue
+                    
                     # Check for death
                     if self.detect_death(current_state, previous_state):
-                        print(f"Death detected at frame {frames_alive}")
+                        print(f"💀 Death detected at frame {frames_alive}")
+                        # Print death summary
+                        self.print_agent_death_summary(genome_id, fitness, frames_alive, max_score)
                         break
                     
                     # Calculate current score
@@ -361,6 +430,7 @@ survival_threshold = 0.2
                     if score > max_score:
                         max_score = score
                         fitness += 100  # Bonus for eating apples
+                        print(f"🍎 Apple eaten! Score: {score}, Current Fitness: {fitness:.2f}")
                     
                     # Get AI decision
                     output = net.activate(current_state)
@@ -379,7 +449,13 @@ survival_threshold = 0.2
                         fitness += 0.1
                     
                     frames_alive += 1
+                    frames_since_restart += 1
                     previous_state = current_state.copy()
+                    
+                    # Progress report every 500 frames
+                    if frames_alive - last_progress_report >= 500:
+                        print(f"📊 Progress: {frames_alive}/{max_frames} frames, Score: {score}, Fitness: {fitness:.2f}")
+                        last_progress_report = frames_alive
                 
                 # Small delay to control game speed
                 time.sleep(0.02)  # Faster evaluation
@@ -399,31 +475,189 @@ survival_threshold = 0.2
             fitness *= 0.5
         
         genome.fitness = fitness
-        print(f"Genome fitness: {fitness:.2f}, Frames alive: {frames_alive}, Max score: {max_score}")
+        
+        # Print final death summary if not already printed
+        if frames_alive >= max_frames:
+            print(f"⏰ Time limit reached!")
+            self.print_agent_death_summary(genome_id, fitness, frames_alive, max_score)
         
         return fitness
     
     def run_generation(self, genomes, config):
         """Run a generation of genomes"""
-        print(f"\n--- Generation {self.current_generation} ---")
+        print(f"\n{'='*80}")
+        print(f"🧬 GENERATION {self.current_generation} STARTED")
+        print(f"{'='*80}")
+        print(f"Population Size: {len(genomes)}")
+        print(f"Overall Best Fitness: {self.best_fitness:.2f}")
+        print(f"{'='*80}")
         
-        for genome_id, genome in genomes:
-            print(f"Evaluating genome {genome_id}")
-            fitness = self.evaluate_genome(genome, config)
+        self.generation_fitnesses = []
+        generation_best_fitness = 0
+        self.total_individuals = len(genomes)
+        
+        for i, (genome_id, genome) in enumerate(genomes, 1):
+            self.current_individual = i
+            
+            fitness = self.evaluate_genome(genome, config, genome_id)
+            self.generation_fitnesses.append(fitness)
+            
+            if fitness > generation_best_fitness:
+                generation_best_fitness = fitness
             
             if fitness > self.best_fitness:
                 self.best_fitness = fitness
-                print(f"New best fitness: {fitness:.2f}")
+                print(f"\n🎉 NEW OVERALL BEST FITNESS: {fitness:.2f}")
                 
                 # Save best genome
                 with open(f'best_genome_gen_{self.current_generation}.pkl', 'wb') as f:
                     pickle.dump(genome, f)
         
+        # Generation summary
+        print(f"\n{'='*80}")
+        print(f"📊 GENERATION {self.current_generation} COMPLETED")
+        print(f"{'='*80}")
+        print(f"Best fitness this generation: {generation_best_fitness:.2f}")
+        print(f"Average fitness this generation: {np.mean(self.generation_fitnesses):.2f}")
+        print(f"Worst fitness this generation: {min(self.generation_fitnesses):.2f}")
+        print(f"Fitness std deviation: {np.std(self.generation_fitnesses):.2f}")
+        print(f"Overall best fitness: {self.best_fitness:.2f}")
+        
+        # Show improvement
+        if self.current_generation > 0:
+            improvement = generation_best_fitness - (self.best_fitness if generation_best_fitness <= self.best_fitness else 0)
+            print(f"Generation improvement: {improvement:.2f}")
+        
+        print(f"{'='*80}")
+        
         self.current_generation += 1
+    
+    def print_species_report(self, species, best_genome):
+        """Print detailed species information at the end of generation"""
+        print(f"\n{'='*80}")
+        print(f"🧬 SPECIES ANALYSIS - Generation {self.current_generation}")
+        print(f"{'='*80}")
+        print(f"Total Species: {len(species.species)}")
+        print(f"Overall Best Genome ID: {best_genome.key}")
+        print(f"Overall Best Fitness: {best_genome.fitness:.2f}")
+        print(f"{'='*80}")
+        
+        # Sort species by fitness for better readability
+        sorted_species = sorted(species.species.items(), 
+                              key=lambda x: x[1].fitness, reverse=True)
+        
+        for rank, (species_id, species_obj) in enumerate(sorted_species, 1):
+            print(f"\n🏆 SPECIES {species_id} (Rank #{rank})")
+            print(f"{'─'*50}")
+            
+            # Basic species info
+            print(f"Members: {len(species_obj.members)}")
+            print(f"Best Fitness: {species_obj.fitness:.2f}")
+            print(f"Species Age: {species_obj.age} generations")
+            print(f"Stagnation: {species_obj.fitness_history.count(species_obj.fitness)} generations at current best")
+            
+            # Member fitness statistics
+            member_fitnesses = [member.fitness for member in species_obj.members.values()]
+            print(f"Average Fitness: {np.mean(member_fitnesses):.2f}")
+            print(f"Worst Fitness: {min(member_fitnesses):.2f}")
+            print(f"Fitness Std Dev: {np.std(member_fitnesses):.2f}")
+            
+            # Find best member
+            best_member = max(species_obj.members.values(), key=lambda x: x.fitness)
+            print(f"Best Member ID: {best_member.key}")
+            print(f"Best Member Fitness: {best_member.fitness:.2f}")
+            
+            # Show fitness distribution
+            fitness_ranges = {
+                'Elite (>80th percentile)': 0,
+                'Good (60-80th percentile)': 0,
+                'Average (40-60th percentile)': 0,
+                'Below Average (20-40th percentile)': 0,
+                'Poor (<20th percentile)': 0
+            }
+            
+            if len(member_fitnesses) > 0:
+                percentiles = np.percentile(member_fitnesses, [20, 40, 60, 80])
+                for fitness in member_fitnesses:
+                    if fitness >= percentiles[3]:
+                        fitness_ranges['Elite (>80th percentile)'] += 1
+                    elif fitness >= percentiles[2]:
+                        fitness_ranges['Good (60-80th percentile)'] += 1
+                    elif fitness >= percentiles[1]:
+                        fitness_ranges['Average (40-60th percentile)'] += 1
+                    elif fitness >= percentiles[0]:
+                        fitness_ranges['Below Average (20-40th percentile)'] += 1
+                    else:
+                        fitness_ranges['Poor (<20th percentile)'] += 1
+                
+                print(f"Fitness Distribution:")
+                for range_name, count in fitness_ranges.items():
+                    percentage = (count / len(member_fitnesses)) * 100
+                    print(f"  {range_name}: {count} members ({percentage:.1f}%)")
+            
+            # Show if species is improving or stagnating
+            if len(species_obj.fitness_history) > 1:
+                recent_improvement = species_obj.fitness_history[-1] - species_obj.fitness_history[-2]
+                if recent_improvement > 0:
+                    print(f"📈 Recent Improvement: +{recent_improvement:.2f}")
+                elif recent_improvement < 0:
+                    print(f"📉 Recent Decline: {recent_improvement:.2f}")
+                else:
+                    print(f"📊 No Change: {recent_improvement:.2f}")
+            
+            # Show species diversity (connection count as proxy)
+            connection_counts = []
+            for member in species_obj.members.values():
+                connection_counts.append(len(member.connections))
+            
+            if connection_counts:
+                print(f"Network Complexity:")
+                print(f"  Avg Connections: {np.mean(connection_counts):.1f}")
+                print(f"  Min Connections: {min(connection_counts)}")
+                print(f"  Max Connections: {max(connection_counts)}")
+            
+            print(f"{'─'*50}")
+        
+        # Species comparison summary
+        print(f"\n{'='*80}")
+        print(f"📊 SPECIES COMPARISON SUMMARY")
+        print(f"{'='*80}")
+        
+        # Most populous species
+        most_populous = max(species.species.items(), key=lambda x: len(x[1].members))
+        print(f"Most Populous Species: {most_populous[0]} ({len(most_populous[1].members)} members)")
+        
+        # Most improved species
+        improving_species = []
+        for species_id, species_obj in species.species.items():
+            if len(species_obj.fitness_history) > 1:
+                improvement = species_obj.fitness_history[-1] - species_obj.fitness_history[-2]
+                improving_species.append((species_id, improvement))
+        
+        if improving_species:
+            best_improvement = max(improving_species, key=lambda x: x[1])
+            print(f"Most Improved Species: {best_improvement[0]} (+{best_improvement[1]:.2f})")
+        
+        # Oldest species
+        oldest_species = max(species.species.items(), key=lambda x: x[1].age)
+        print(f"Oldest Species: {oldest_species[0]} ({oldest_species[1].age} generations)")
+        
+        # Species with best average fitness
+        avg_fitnesses = []
+        for species_id, species_obj in species.species.items():
+            member_fitnesses = [member.fitness for member in species_obj.members.values()]
+            avg_fitnesses.append((species_id, np.mean(member_fitnesses)))
+        
+        if avg_fitnesses:
+            best_avg = max(avg_fitnesses, key=lambda x: x[1])
+            print(f"Best Average Fitness Species: {best_avg[0]} ({best_avg[1]:.2f})")
+        
+        print(f"{'='*80}")
     
     def run(self):
         """Main execution function"""
-        print("Starting NEAT Snake AI...")
+        print("🐍 NEAT Snake AI - Enhanced Reporting System")
+        print("=" * 60)
         print("Make sure your Snake game is visible and positioned correctly.")
         print("The AI will start learning in 5 seconds...")
         
@@ -452,6 +686,16 @@ survival_threshold = 0.2
         stats = neat.StatisticsReporter()
         population.add_reporter(stats)
         
+        # Custom reporter for species information
+        class CustomReporter(neat.reporting.BaseReporter):
+            def __init__(self, snake_ai_instance):
+                self.snake_ai = snake_ai_instance
+                
+            def post_evaluate(self, config, population, species, best_genome):
+                self.snake_ai.print_species_report(species, best_genome)
+        
+        population.add_reporter(CustomReporter(self))
+        
         # Run evolution
         try:
             winner = population.run(self.run_generation, 50)  # 50 generations
@@ -460,10 +704,10 @@ survival_threshold = 0.2
             with open('winner_genome.pkl', 'wb') as f:
                 pickle.dump(winner, f)
             
-            print(f"\nEvolution completed! Best fitness: {self.best_fitness:.2f}")
+            print(f"\n🏆 Evolution completed! Best fitness: {self.best_fitness:.2f}")
             
         except KeyboardInterrupt:
-            print("\nEvolution interrupted by user")
+            print("\n⚠️ Evolution interrupted by user")
         finally:
             self.running = False
             if self.capture_thread:
@@ -487,7 +731,7 @@ survival_threshold = 0.2
         # Create network
         net = neat.nn.FeedForwardNetwork.create(genome, config)
         
-        print("Playing with trained AI...")
+        print("🎮 Playing with trained AI...")
         print("Press Ctrl+C to stop")
         
         self.running = True
@@ -500,10 +744,27 @@ survival_threshold = 0.2
         # Reset game
         self.restart_game()
         
+        previous_state = None
+        frames_since_restart = 0
+        
         try:
             while self.running:
                 if not self.screen_queue.empty():
                     current_state = self.screen_queue.get_nowait()
+                    
+                    # Skip first few frames after restart
+                    if frames_since_restart < 10:
+                        frames_since_restart += 1
+                        previous_state = current_state.copy()
+                        continue
+                    
+                    # Check for death and auto-restart
+                    if self.detect_death(current_state, previous_state):
+                        print("💀 Death detected - auto-restarting...")
+                        self.restart_game()
+                        frames_since_restart = 0
+                        previous_state = None
+                        continue
                     
                     # Get AI decision
                     output = net.activate(current_state)
@@ -517,17 +778,21 @@ survival_threshold = 0.2
                         grid_state = self.game_analyzer.analyze_grid()
                         self.game_analyzer.print_grid(grid_state)
                         print(f"Score: {self.calculate_score(current_state)}")
+                    
+                    previous_state = current_state.copy()
+                    frames_since_restart += 1
                 
                 time.sleep(0.05)
                 
         except KeyboardInterrupt:
-            print("\nStopped by user")
+            print("\n⚠️ Stopped by user")
         finally:
             self.running = False
 
 def main():
     """Main function"""
-    print("NEAT Snake AI - Grid State Analysis Version")
+    print("🐍 NEAT Snake AI - Enhanced Reporting System")
+    print("=" * 60)
     print("1. Train new AI")
     print("2. Play with trained AI")
     print("3. Test game analyzer")
