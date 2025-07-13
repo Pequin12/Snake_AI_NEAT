@@ -1,0 +1,571 @@
+import cv2
+import numpy as np
+from PIL import ImageGrab
+import time
+import neat
+import os
+import pickle
+import pyautogui
+import threading
+import queue
+
+class SnakeGameAnalyzer:
+    def __init__(self, x1=520, y1=225, x2=1405, y2=1005, grid_width=17, grid_height=15):
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+        self.grid_width = grid_width
+        self.grid_height = grid_height
+        
+        # Calculate box dimensions
+        self.box_width = (x2 - x1) / grid_width
+        self.box_height = (y2 - y1) / grid_height
+        
+        # Color thresholds for different states (BGR format)
+        self.color_ranges = {
+            'apple': {
+                'lower': np.array([0, 0, 150]),    # Red apple
+                'upper': np.array([50, 50, 255])
+            },
+            'body': {
+                'lower': np.array([80, 0, 0]),     # All tones of blue for body (including head)
+                'upper': np.array([255, 100, 100])
+            },
+            'empty': {
+                'lower': np.array([0, 100, 0]),    # Green empty spaces
+                'upper': np.array([100, 255, 100])
+            }
+        }
+    
+    def capture_screen(self):
+        """Capture the specified screen region"""
+        screenshot = ImageGrab.grab(bbox=(self.x1, self.y1, self.x2, self.y2))
+        return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+    
+    def get_box_center(self, row, col):
+        """Get the center coordinates of a specific box"""
+        center_x = int(col * self.box_width + self.box_width / 2)
+        center_y = int(row * self.box_height + self.box_height / 2)
+        return center_x, center_y
+    
+    def get_box_region(self, image, row, col):
+        """Extract a small region around the center of a box for analysis"""
+        center_x, center_y = self.get_box_center(row, col)
+        
+        # Sample a small region around the center
+        sample_size = 10
+        x1 = max(0, center_x - sample_size)
+        y1 = max(0, center_y - sample_size)
+        x2 = min(image.shape[1], center_x + sample_size)
+        y2 = min(image.shape[0], center_y + sample_size)
+        
+        return image[y1:y2, x1:x2]
+    
+    def analyze_box_color(self, box_region):
+        """Analyze the dominant color in a box region"""
+        if box_region.size == 0:
+            return 'empty'
+        
+        # Calculate average color
+        avg_color = np.mean(box_region, axis=(0, 1))
+        
+        # Check for body (all tones of blue, including head)
+        if avg_color[0] > 80 and avg_color[1] < 100 and avg_color[2] < 100:
+            return 'body'
+        
+        # Check for empty (green)
+        if avg_color[1] > 100 and avg_color[0] < 100 and avg_color[2] < 100:
+            return 'empty'
+        
+        # Check for apple (red)
+        if avg_color[2] > 150 and avg_color[0] < 50 and avg_color[1] < 50:
+            return 'apple'
+        
+        # Fallback to original color range checking
+        for state, color_range in self.color_ranges.items():
+            lower = color_range['lower']
+            upper = color_range['upper']
+            
+            if np.all(avg_color >= lower) and np.all(avg_color <= upper):
+                return state
+        
+        # If no exact match, find closest match based on dominant color
+        if avg_color[0] > max(avg_color[1], avg_color[2]):  # Blue dominant
+            return 'body'
+        elif avg_color[1] > max(avg_color[0], avg_color[2]):  # Green dominant
+            return 'empty'
+        elif avg_color[2] > max(avg_color[0], avg_color[1]):  # Red dominant
+            return 'apple'
+        else:
+            return 'empty'
+    
+    def analyze_grid(self):
+        """Analyze the entire grid and return the state of each box"""
+        image = self.capture_screen()
+        grid_state = []
+        
+        for row in range(self.grid_height):
+            row_state = []
+            for col in range(self.grid_width):
+                box_region = self.get_box_region(image, row, col)
+                state = self.analyze_box_color(box_region)
+                row_state.append(state)
+            grid_state.append(row_state)
+        
+        return grid_state
+    
+    def get_flattened_state(self):
+        """Get the grid state as a flattened array of numerical values"""
+        grid_state = self.analyze_grid()
+        
+        # Convert states to numbers for neural network input
+        state_to_num = {
+            'empty': 0,
+            'apple': 1,
+            'body': 2
+        }
+        
+        # Flatten the grid and convert to numbers
+        flattened = []
+        for row in grid_state:
+            for cell in row:
+                flattened.append(state_to_num.get(cell, 0))
+        
+        return np.array(flattened, dtype=np.float32)
+    
+    def print_grid(self, grid_state):
+        """Print the grid state in a readable format"""
+        symbols = {
+            'empty': '.',
+            'apple': 'A',
+            'body': 'B'
+        }
+        
+        print("Snake Game Grid State:")
+        print("-" * (self.grid_width * 2 + 1))
+        
+        for row in grid_state:
+            print("|", end="")
+            for cell in row:
+                print(symbols.get(cell, '?'), end=" ")
+            print("|")
+        
+        print("-" * (self.grid_width * 2 + 1))
+
+class SnakeAI:
+    def __init__(self, config_path='config-feedforward.txt'):
+        self.config_path = config_path
+        self.capture_interval = 0.05  # 50ms
+        self.running = False
+        self.current_generation = 0
+        self.best_fitness = 0
+        
+        # Initialize game analyzer
+        self.game_analyzer = SnakeGameAnalyzer()
+        
+        # Game state tracking
+        self.game_start_time = 0
+        self.last_game_state = None
+        self.death_detected = False
+        self.survival_time = 0
+        self.last_score = 0
+        
+        # Screen capture queue
+        self.screen_queue = queue.Queue(maxsize=10)
+        self.capture_thread = None
+        
+        # Create NEAT configuration
+        self.create_neat_config()
+        
+    def create_neat_config(self):
+        """Create NEAT configuration file"""
+        # Calculate total inputs (17 x 15 = 255 boxes)
+        total_inputs = self.game_analyzer.grid_width * self.game_analyzer.grid_height
+        
+        config_content = f"""
+[NEAT]
+fitness_criterion     = max
+fitness_threshold     = 10000
+pop_size              = 100
+reset_on_extinction   = False
+
+[DefaultGenome]
+# node activation options
+activation_default      = sigmoid
+activation_mutate_rate  = 0.05
+activation_options      = sigmoid relu tanh
+
+# node aggregation options
+aggregation_default     = sum
+aggregation_mutate_rate = 0.05
+aggregation_options     = sum
+
+# node bias options
+bias_init_mean          = 0.0
+bias_init_stdev         = 1.0
+bias_max_value          = 30.0
+bias_min_value          = -30.0
+bias_mutate_power       = 0.5
+bias_mutate_rate        = 0.7
+bias_replace_rate       = 0.1
+
+# genome compatibility options
+compatibility_disjoint_coefficient = 1.0
+compatibility_weight_coefficient   = 0.5
+
+# connection add/remove rates
+conn_add_prob           = 0.5
+conn_delete_prob        = 0.5
+
+# connection enable options
+enabled_default         = True
+enabled_mutate_rate     = 0.01
+
+feed_forward            = True
+initial_connection      = full
+
+# node add/remove rates
+node_add_prob           = 0.2
+node_delete_prob        = 0.2
+
+# network parameters
+num_hidden              = 0
+num_inputs              = {total_inputs}
+num_outputs             = 4
+
+# node response options
+response_init_mean      = 1.0
+response_init_stdev     = 0.0
+response_max_value      = 30.0
+response_min_value      = -30.0
+response_mutate_power   = 0.0
+response_mutate_rate    = 0.0
+response_replace_rate   = 0.0
+
+# connection weight options
+weight_init_mean        = 0.0
+weight_init_stdev       = 1.0
+weight_max_value        = 30
+weight_min_value        = -30
+weight_mutate_power     = 0.5
+weight_mutate_rate      = 0.8
+weight_replace_rate     = 0.1
+
+[DefaultSpeciesSet]
+compatibility_threshold = 3.0
+
+[DefaultStagnation]
+species_fitness_func = max
+max_stagnation       = 20
+species_elitism      = 2
+
+[DefaultReproduction]
+elitism            = 2
+survival_threshold = 0.2
+"""
+        with open(self.config_path, 'w') as f:
+            f.write(config_content)
+    
+    def capture_game_state_continuous(self):
+        """Continuously capture game state in a separate thread"""
+        while self.running:
+            try:
+                # Get current game state
+                current_state = self.game_analyzer.get_flattened_state()
+                
+                # Add to queue (non-blocking)
+                if not self.screen_queue.full():
+                    self.screen_queue.put(current_state)
+                
+                time.sleep(self.capture_interval)
+            except Exception as e:
+                print(f"Game state capture error: {e}")
+                time.sleep(0.1)
+    
+    def detect_death(self, current_state, previous_state):
+        """Detect if the snake died by comparing game states"""
+        if previous_state is None:
+            return False
+        
+        # Count body segments in current vs previous state
+        current_body_count = np.sum(current_state == 2)
+        previous_body_count = np.sum(previous_state == 2)
+        
+        # If body count drops significantly, snake likely died
+        if current_body_count < previous_body_count * 0.5:
+            return True
+        
+        # Also check for sudden major changes in game state
+        state_diff = np.sum(np.abs(current_state - previous_state))
+        if state_diff > len(current_state) * 0.4:  # 40% of state changed
+            return True
+        
+        return False
+    
+    def calculate_score(self, current_state):
+        """Calculate current score based on body segments"""
+        body_count = np.sum(current_state == 2)
+        return max(0, body_count - 3)  # Assuming initial snake has 3 segments
+    
+    def send_input(self, action):
+        """Send keyboard input based on AI decision"""
+        # Actions: 0=up, 1=down, 2=left, 3=right
+        key_map = {
+            0: 'up',
+            1: 'down', 
+            2: 'left',
+            3: 'right'
+        }
+        
+        if action in key_map:
+            pyautogui.press(key_map[action])
+    
+    def restart_game(self):
+        """Restart the game by pressing space"""
+        pyautogui.press('space')
+        time.sleep(0.5)  # Wait for game to restart
+        self.game_start_time = time.time()
+        self.death_detected = False
+        self.last_score = 0
+    
+    def evaluate_genome(self, genome, config):
+        """Evaluate a single genome"""
+        # Create neural network
+        net = neat.nn.FeedForwardNetwork.create(genome, config)
+        
+        # Reset game
+        self.restart_game()
+        
+        fitness = 0
+        frames_alive = 0
+        max_frames = 2000  # Reduced for faster training
+        score = 0
+        max_score = 0
+        
+        previous_state = None
+        
+        while frames_alive < max_frames and self.running:
+            try:
+                # Get current game state
+                if not self.screen_queue.empty():
+                    current_state = self.screen_queue.get_nowait()
+                    
+                    # Check for death
+                    if self.detect_death(current_state, previous_state):
+                        print(f"Death detected at frame {frames_alive}")
+                        break
+                    
+                    # Calculate current score
+                    score = self.calculate_score(current_state)
+                    if score > max_score:
+                        max_score = score
+                        fitness += 100  # Bonus for eating apples
+                    
+                    # Get AI decision
+                    output = net.activate(current_state)
+                    action = np.argmax(output)
+                    
+                    # Send input
+                    self.send_input(action)
+                    
+                    # Update fitness (reward for staying alive)
+                    fitness += 1
+                    
+                    # Bonus for being near apples
+                    apple_positions = np.where(current_state == 1)[0]
+                    if len(apple_positions) > 0:
+                        # Simple proximity bonus (this is a basic implementation)
+                        fitness += 0.1
+                    
+                    frames_alive += 1
+                    previous_state = current_state.copy()
+                
+                # Small delay to control game speed
+                time.sleep(0.02)  # Faster evaluation
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error in evaluation: {e}")
+                break
+        
+        # Final fitness calculation
+        fitness += frames_alive * 0.1  # Survival bonus
+        fitness += max_score * 1000    # Score bonus (eating apples)
+        
+        # Penalty for dying early
+        if frames_alive < 100:
+            fitness *= 0.5
+        
+        genome.fitness = fitness
+        print(f"Genome fitness: {fitness:.2f}, Frames alive: {frames_alive}, Max score: {max_score}")
+        
+        return fitness
+    
+    def run_generation(self, genomes, config):
+        """Run a generation of genomes"""
+        print(f"\n--- Generation {self.current_generation} ---")
+        
+        for genome_id, genome in genomes:
+            print(f"Evaluating genome {genome_id}")
+            fitness = self.evaluate_genome(genome, config)
+            
+            if fitness > self.best_fitness:
+                self.best_fitness = fitness
+                print(f"New best fitness: {fitness:.2f}")
+                
+                # Save best genome
+                with open(f'best_genome_gen_{self.current_generation}.pkl', 'wb') as f:
+                    pickle.dump(genome, f)
+        
+        self.current_generation += 1
+    
+    def run(self):
+        """Main execution function"""
+        print("Starting NEAT Snake AI...")
+        print("Make sure your Snake game is visible and positioned correctly.")
+        print("The AI will start learning in 5 seconds...")
+        
+        # Wait for user to position game window
+        for i in range(5, 0, -1):
+            print(f"Starting in {i}...")
+            time.sleep(1)
+        
+        self.running = True
+        
+        # Start game state capture thread
+        self.capture_thread = threading.Thread(target=self.capture_game_state_continuous)
+        self.capture_thread.daemon = True
+        self.capture_thread.start()
+        
+        # Load NEAT configuration
+        config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
+                           neat.DefaultSpeciesSet, neat.DefaultStagnation,
+                           self.config_path)
+        
+        # Create population
+        population = neat.Population(config)
+        
+        # Add reporters
+        population.add_reporter(neat.StdOutReporter(True))
+        stats = neat.StatisticsReporter()
+        population.add_reporter(stats)
+        
+        # Run evolution
+        try:
+            winner = population.run(self.run_generation, 50)  # 50 generations
+            
+            # Save winner
+            with open('winner_genome.pkl', 'wb') as f:
+                pickle.dump(winner, f)
+            
+            print(f"\nEvolution completed! Best fitness: {self.best_fitness:.2f}")
+            
+        except KeyboardInterrupt:
+            print("\nEvolution interrupted by user")
+        finally:
+            self.running = False
+            if self.capture_thread:
+                self.capture_thread.join(timeout=1)
+    
+    def play_with_trained_ai(self, genome_file='winner_genome.pkl'):
+        """Play the game with a trained AI"""
+        if not os.path.exists(genome_file):
+            print(f"Genome file {genome_file} not found!")
+            return
+        
+        # Load trained genome
+        with open(genome_file, 'rb') as f:
+            genome = pickle.load(f)
+        
+        # Load configuration
+        config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
+                           neat.DefaultSpeciesSet, neat.DefaultStagnation,
+                           self.config_path)
+        
+        # Create network
+        net = neat.nn.FeedForwardNetwork.create(genome, config)
+        
+        print("Playing with trained AI...")
+        print("Press Ctrl+C to stop")
+        
+        self.running = True
+        
+        # Start game state capture
+        self.capture_thread = threading.Thread(target=self.capture_game_state_continuous)
+        self.capture_thread.daemon = True
+        self.capture_thread.start()
+        
+        # Reset game
+        self.restart_game()
+        
+        try:
+            while self.running:
+                if not self.screen_queue.empty():
+                    current_state = self.screen_queue.get_nowait()
+                    
+                    # Get AI decision
+                    output = net.activate(current_state)
+                    action = np.argmax(output)
+                    
+                    # Send input
+                    self.send_input(action)
+                    
+                    # Print current grid state occasionally
+                    if np.random.random() < 0.1:  # 10% chance to print
+                        grid_state = self.game_analyzer.analyze_grid()
+                        self.game_analyzer.print_grid(grid_state)
+                        print(f"Score: {self.calculate_score(current_state)}")
+                
+                time.sleep(0.05)
+                
+        except KeyboardInterrupt:
+            print("\nStopped by user")
+        finally:
+            self.running = False
+
+def main():
+    """Main function"""
+    print("NEAT Snake AI - Grid State Analysis Version")
+    print("1. Train new AI")
+    print("2. Play with trained AI")
+    print("3. Test game analyzer")
+    
+    choice = input("Enter your choice (1-3): ")
+    
+    if choice == '1':
+        snake_ai = SnakeAI()
+        snake_ai.run()
+    elif choice == '2':
+        snake_ai = SnakeAI()
+        snake_ai.play_with_trained_ai()
+    elif choice == '3':
+        # Test the game analyzer
+        analyzer = SnakeGameAnalyzer()
+        print("Testing game analyzer...")
+        print("Press Ctrl+C to stop")
+        
+        try:
+            while True:
+                grid_state = analyzer.analyze_grid()
+                os.system('cls' if os.name == 'nt' else 'clear')
+                analyzer.print_grid(grid_state)
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\nStopped")
+    else:
+        print("Invalid choice")
+
+if __name__ == "__main__":
+    # Install required packages
+    required_packages = [
+        'opencv-python', 'numpy', 'pyautogui', 
+        'neat-python', 'pillow'
+    ]
+    
+    print("Required packages:", ", ".join(required_packages))
+    print("Install with: pip install " + " ".join(required_packages))
+    print()
+    
+    main()
